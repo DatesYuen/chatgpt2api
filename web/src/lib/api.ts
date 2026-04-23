@@ -54,22 +54,45 @@ export type SettingsConfig = {
   proxy: string;
   base_url?: string;
   refresh_account_interval_minute?: number | string;
+  authentik?: {
+    enabled: boolean;
+    issuer: string;
+    client_id: string;
+    client_secret: string;
+    scopes: string;
+  };
   [key: string]: unknown;
 };
 
 export type LoginResponse = {
   ok: boolean;
+  token?: string | null;
   version: string;
   role: AuthRole;
   subject_id: string;
+  username: string;
   name: string;
+  quota_limit?: number | null;
+  quota_remaining?: number | null;
+  quota_used?: number | null;
+  quota_reset_at?: string | null;
 };
 
-export type UserKey = {
+export type LocalUser = {
   id: string;
+  username: string;
   name: string;
-  role: "user";
+  display_name?: string;
+  role: AuthRole;
   enabled: boolean;
+  has_password: boolean;
+  has_api_key: boolean;
+  daily_image_limit: number;
+  quota_remaining?: number | null;
+  quota_used?: number | null;
+  quota_reset_at?: string | null;
+  authentik_username?: string;
+  authentik_subject?: string;
   created_at: string | null;
   last_used_at: string | null;
 };
@@ -83,7 +106,37 @@ export async function login(authKey: string) {
       Authorization: `Bearer ${normalizedAuthKey}`,
     },
     redirectOnUnauthorized: false,
+    skipAuth: true,
   });
+}
+
+export async function loginWithPassword(username: string, password: string) {
+  return httpRequest<LoginResponse>("/auth/login/password", {
+    method: "POST",
+    body: { username, password },
+    redirectOnUnauthorized: false,
+    skipAuth: true,
+  });
+}
+
+export async function exchangeAuthentikTicket(ticket: string) {
+  return httpRequest<LoginResponse>("/auth/exchange", {
+    method: "POST",
+    body: { ticket },
+    redirectOnUnauthorized: false,
+    skipAuth: true,
+  });
+}
+
+export async function fetchAuthentikStatus() {
+  return httpRequest<{ enabled: boolean }>("/auth/authentik/status", {
+    redirectOnUnauthorized: false,
+    skipAuth: true,
+  });
+}
+
+export async function fetchAuthMe() {
+  return httpRequest<LoginResponse>("/auth/me");
 }
 
 export async function fetchAccounts() {
@@ -176,27 +229,52 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
   });
 }
 
-export async function fetchUserKeys() {
-  return httpRequest<{ items: UserKey[] }>("/api/auth/users");
+export async function fetchUsers() {
+  return httpRequest<{ items: LocalUser[] }>("/api/auth/users");
 }
 
-export async function createUserKey(name: string) {
-  return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
+export async function createUser(payload: {
+  username: string;
+  display_name: string;
+  role: AuthRole;
+  password: string;
+  enabled: boolean;
+  daily_image_limit: number;
+  authentik_username: string;
+}) {
+  return httpRequest<{ item: LocalUser; items: LocalUser[] }>("/api/auth/users", {
     method: "POST",
-    body: { name },
+    body: payload,
   });
 }
 
-export async function updateUserKey(keyId: string, updates: { enabled?: boolean; name?: string }) {
-  return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {
+export async function updateUser(
+  keyId: string,
+  updates: {
+    username?: string;
+    display_name?: string;
+    role?: AuthRole;
+    password?: string;
+    enabled?: boolean;
+    daily_image_limit?: number;
+    authentik_username?: string;
+  },
+) {
+  return httpRequest<{ item: LocalUser; items: LocalUser[] }>(`/api/auth/users/${keyId}`, {
     method: "POST",
     body: updates,
   });
 }
 
-export async function deleteUserKey(keyId: string) {
-  return httpRequest<{ items: UserKey[] }>(`/api/auth/users/${keyId}`, {
+export async function deleteUser(keyId: string) {
+  return httpRequest<{ items: LocalUser[] }>(`/api/auth/users/${keyId}`, {
     method: "DELETE",
+  });
+}
+
+export async function resetUserApiKey(keyId: string) {
+  return httpRequest<{ item: LocalUser; key: string; items: LocalUser[] }>(`/api/auth/users/${keyId}/api-key`, {
+    method: "POST",
   });
 }
 

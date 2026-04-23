@@ -18,7 +18,7 @@ class _FakeThread:
 class _FakeChatGPTService:
     last_call: dict[str, object] | None = None
 
-    def __init__(self, _account_service) -> None:
+    def __init__(self, _account_service, *_args) -> None:
         return None
 
     def edit_with_pool(
@@ -29,6 +29,7 @@ class _FakeChatGPTService:
         n: int,
         response_format: str = "b64_json",
         base_url: str | None = None,
+        identity: dict[str, object] | None = None,
     ):
         normalized_images = list(images)
         type(self).last_call = {
@@ -38,13 +39,22 @@ class _FakeChatGPTService:
             "n": n,
             "response_format": response_format,
             "base_url": base_url,
+            "identity": identity,
         }
         return {
             "created": 123,
             "data": [{"b64_json": "ZmFrZQ==", "revised_prompt": prompt}],
         }
 
-    def generate_with_pool(self, prompt: str, model: str, n: int, response_format: str = "b64_json", base_url: str = ""):
+    def generate_with_pool(
+        self,
+        prompt: str,
+        model: str,
+        n: int,
+        response_format: str = "b64_json",
+        base_url: str = "",
+        identity: dict[str, object] | None = None,
+    ):
         return {
             "created": 123,
             "data": [{"b64_json": "ZmFrZQ==", "revised_prompt": prompt, "url": f"{base_url}/images/fake.png"}],
@@ -154,9 +164,11 @@ class ApiAuthRoleTests(unittest.TestCase):
 
         self.assertEqual(admin_response.status_code, 200)
         self.assertEqual(admin_response.json()["role"], "admin")
+        self.assertTrue(admin_response.json()["token"].startswith("cg2a_session."))
         self.assertEqual(user_response.status_code, 200)
         self.assertEqual(user_response.json()["role"], "user")
         self.assertEqual(user_response.json()["name"], "设计同学")
+        self.assertEqual(user_response.json()["username"], self.user_item["username"])
 
     def test_user_is_forbidden_from_admin_endpoints(self) -> None:
         settings_response = self.client.get("/api/settings", headers=self._auth_header(self.user_key))
@@ -174,16 +186,16 @@ class ApiAuthRoleTests(unittest.TestCase):
         create_user_response = self.client.post(
             "/api/auth/users",
             headers=self._auth_header("admin-secret"),
-            json={"name": "运营同学"},
+            json={"username": "ops-user", "display_name": "运营同学", "role": "user", "daily_image_limit": 20},
         )
 
         self.assertEqual(image_response.status_code, 200)
         self.assertEqual(image_response.json()["data"][0]["revised_prompt"], "test prompt")
         self.assertEqual(create_user_response.status_code, 200)
         payload = create_user_response.json()
-        self.assertTrue(payload["key"].startswith("cg2a_user_"))
         self.assertEqual(payload["item"]["role"], "user")
         self.assertEqual(payload["item"]["name"], "运营同学")
+        self.assertEqual(payload["item"]["username"], "ops-user")
 
     def test_accepts_repeated_image_bracket_field(self) -> None:
         response = self.client.post(

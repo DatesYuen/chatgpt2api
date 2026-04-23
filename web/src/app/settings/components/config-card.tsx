@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
 
@@ -20,6 +21,7 @@ export function ConfigCard() {
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
+  const setAuthentikField = useSettingsStore((state) => state.setAuthentikField);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
 
   const handleTestProxy = async () => {
@@ -59,7 +61,7 @@ export function ConfigCard() {
     <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
       <CardContent className="space-y-4 p-6">
         <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
-          管理员登录密钥继续从部署配置读取，不再在此页面展示；如需分发给其他人，请在下方创建普通用户密钥。
+          管理员部署密钥继续作为兼容入口保留；本地用户登录、Authentik OIDC 配置和普通用户额度控制都在这里维护。
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
@@ -119,6 +121,58 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">用于生成图片结果的访问前缀地址。</p>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-stone-200 bg-stone-50/70 p-4">
+          <div className="mb-4 flex items-center gap-3">
+            <Checkbox
+              checked={Boolean(config?.authentik?.enabled)}
+              onCheckedChange={(checked) => setAuthentikField("enabled", Boolean(checked))}
+            />
+            <div>
+              <div className="text-sm font-medium text-stone-800">启用 Authentik 登录</div>
+              <div className="text-xs text-stone-500">使用 OIDC 授权码流程，首次登录会自动创建普通用户。</div>
+            </div>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">Issuer</label>
+              <Input
+                value={String(config?.authentik?.issuer || "")}
+                onChange={(event) => setAuthentikField("issuer", event.target.value)}
+                placeholder="https://auth.example.com/application/o/app/"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">Client ID</label>
+              <Input
+                value={String(config?.authentik?.client_id || "")}
+                onChange={(event) => setAuthentikField("client_id", event.target.value)}
+                placeholder="client id"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">Client Secret</label>
+              <Input
+                type="password"
+                value={String(config?.authentik?.client_secret || "")}
+                onChange={(event) => setAuthentikField("client_secret", event.target.value)}
+                placeholder="client secret"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">Scopes</label>
+              <Input
+                value={String(config?.authentik?.scopes || "openid profile email")}
+                onChange={(event) => setAuthentikField("scopes", event.target.value)}
+                placeholder="openid profile email"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
           </div>
         </div>
 

@@ -104,9 +104,22 @@ class ConfigStore:
             or ""
         ).strip().rstrip("/")
 
+    def get_authentik_settings(self) -> dict[str, object]:
+        raw = self.data.get("authentik")
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "issuer": str(raw.get("issuer") or "").strip().rstrip("/"),
+            "client_id": str(raw.get("client_id") or "").strip(),
+            "client_secret": str(raw.get("client_secret") or "").strip(),
+            "scopes": str(raw.get("scopes") or "openid profile email").strip() or "openid profile email",
+        }
+
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data.pop("auth-key", None)
+        data["authentik"] = self.get_authentik_settings()
         return data
 
     def get_proxy_settings(self) -> str:

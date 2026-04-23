@@ -2,5 +2,12 @@
   "auth-key": "chatgpt2api",
   "refresh_account_interval_minute": 60,
   "proxy": "",
-  "base_url": ""
+  "base_url": "",
+  "authentik": {
+    "enabled": false,
+    "issuer": "",
+    "client_id": "",
+    "client_secret": "",
+    "scopes": "openid profile email"
+  }
 }

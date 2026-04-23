@@ -8,7 +8,12 @@ export type StoredAuthSession = {
   key: string;
   role: AuthRole;
   subjectId: string;
+  username: string;
   name: string;
+  quotaLimit?: number | null;
+  quotaRemaining?: number | null;
+  quotaUsed?: number | null;
+  quotaResetAt?: string | null;
 };
 
 export const AUTH_KEY_STORAGE_KEY = "chatgpt2api_auth_key";
@@ -35,7 +40,17 @@ function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession |
     key,
     role,
     subjectId: String(candidate.subjectId || "").trim(),
+    username: String(candidate.username || "").trim(),
     name: String(candidate.name || "").trim(),
+    quotaLimit:
+      candidate.quotaLimit === null || candidate.quotaLimit === undefined ? null : Number(candidate.quotaLimit || 0),
+    quotaRemaining:
+      candidate.quotaRemaining === null || candidate.quotaRemaining === undefined
+        ? null
+        : Number(candidate.quotaRemaining || 0),
+    quotaUsed:
+      candidate.quotaUsed === null || candidate.quotaUsed === undefined ? null : Number(candidate.quotaUsed || 0),
+    quotaResetAt: String(candidate.quotaResetAt || "").trim() || null,
   };
 }
 

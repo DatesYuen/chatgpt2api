@@ -3,15 +3,18 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Event, Thread
-from fastapi import APIRouter, FastAPI, File, Form, Header, Request, HTTPException, UploadFile
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from fastapi import APIRouter, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.account_service import account_service
-from services.auth_service import auth_service
+from services.auth_service import QuotaExceededError, auth_service
+from services.authentik_service import authentik_service
 from services.chatgpt_service import ChatGPTService
 from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
@@ -98,13 +101,33 @@ class SettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class UserKeyCreateRequest(BaseModel):
-    name: str = ""
+class PasswordLoginRequest(BaseModel):
+    username: str = ""
+    password: str = ""
 
 
-class UserKeyUpdateRequest(BaseModel):
-    name: str | None = None
+class AuthTicketExchangeRequest(BaseModel):
+    ticket: str = ""
+
+
+class UserCreateRequest(BaseModel):
+    username: str = ""
+    display_name: str = ""
+    role: str = "user"
+    password: str = ""
     enabled: bool | None = None
+    daily_image_limit: int = 20
+    authentik_username: str = ""
+
+
+class UserUpdateRequest(BaseModel):
+    username: str | None = None
+    display_name: str | None = None
+    role: str | None = None
+    password: str | None = None
+    enabled: bool | None = None
+    daily_image_limit: int | None = None
+    authentik_username: str | None = None
 
 
 class Sub2APIServerCreateRequest(BaseModel):
@@ -189,7 +212,10 @@ def _legacy_admin_identity(token: str) -> dict[str, object] | None:
         return None
     return {
         "id": "legacy-admin",
+        "subject_id": "legacy-admin",
+        "username": "admin",
         "name": "管理员",
+        "display_name": "管理员",
         "role": "admin",
         "enabled": True,
         "created_at": None,
@@ -214,6 +240,32 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 def resolve_image_base_url(request: Request) -> str:
     configured_base_url = str(getattr(config, "base_url", "") or "").strip()
     return configured_base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+
+
+def build_auth_payload(identity: dict[str, object], app_version: str, *, token: str | None = None) -> dict[str, object]:
+    quota = auth_service.get_quota_status(str(identity.get("id") or identity.get("subject_id") or "")) or {}
+    return {
+        "ok": True,
+        "version": app_version,
+        "token": token,
+        "role": identity.get("role"),
+        "subject_id": identity.get("id") or identity.get("subject_id"),
+        "username": identity.get("username") or ("admin" if identity.get("id") == "legacy-admin" else ""),
+        "name": identity.get("name") or identity.get("display_name") or identity.get("username"),
+        "quota_limit": quota.get("daily_image_limit"),
+        "quota_remaining": quota.get("quota_remaining"),
+        "quota_used": quota.get("quota_used"),
+        "quota_reset_at": quota.get("quota_reset_at"),
+    }
+
+
+def append_query_value(target: str, **updates: str) -> str:
+    parsed = urlparse(target or "/login")
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in updates.items():
+        if value:
+            query[key] = value
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
@@ -262,7 +314,7 @@ def resolve_web_asset(requested_path: str) -> Path | None:
 
 
 def create_app() -> FastAPI:
-    chatgpt_service = ChatGPTService(account_service)
+    chatgpt_service = ChatGPTService(account_service, auth_service)
     app_version = get_app_version()
 
     @asynccontextmanager
@@ -298,13 +350,74 @@ def create_app() -> FastAPI:
     @router.post("/auth/login")
     async def login(authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        return {
-            "ok": True,
-            "version": app_version,
-            "role": identity.get("role"),
-            "subject_id": identity.get("id"),
-            "name": identity.get("name"),
-        }
+        token = auth_service.issue_session_token(identity)
+        return build_auth_payload(identity, app_version, token=token)
+
+    @router.post("/auth/login/password")
+    async def login_with_password(body: PasswordLoginRequest):
+        identity = auth_service.authenticate_password(body.username, body.password)
+        if identity is None:
+            raise HTTPException(status_code=401, detail={"error": "username or password is invalid"})
+        token = auth_service.issue_session_token(identity)
+        return build_auth_payload(identity, app_version, token=token)
+
+    @router.get("/auth/me")
+    async def auth_me(authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        return build_auth_payload(identity, app_version)
+
+    @router.get("/auth/authentik/start")
+    async def authentik_start(request: Request, redirect_to: str | None = Query(default=None)):
+        try:
+            redirect_uri = str(request.url_for("authentik_callback"))
+            start_url = authentik_service.build_authorization_url(
+                redirect_uri=redirect_uri,
+                redirect_to=str(redirect_to or "/login"),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        return RedirectResponse(start_url)
+
+    @router.get("/auth/authentik/callback", name="authentik_callback")
+    async def authentik_callback(
+        request: Request,
+        state: str = "",
+        code: str = "",
+        error: str | None = None,
+    ):
+        state_payload = authentik_service.pop_state(state)
+        redirect_to = str((state_payload or {}).get("redirect_to") or "/login")
+        if error:
+            return RedirectResponse(append_query_value(redirect_to, auth_error=str(error)))
+        if state_payload is None:
+            return RedirectResponse(append_query_value(redirect_to, auth_error="invalid_state"))
+        try:
+            claims = authentik_service.exchange_code(code=code, redirect_uri=str(request.url_for("authentik_callback")))
+            user = auth_service.upsert_authentik_user(claims)
+            identity = auth_service.get_public_user(str(user.get("id") or ""))
+            if identity is None:
+                raise RuntimeError("failed to load authentik user")
+            identity = {
+                **identity,
+                "id": user.get("id"),
+                "subject_id": user.get("id"),
+            }
+            ticket = authentik_service.issue_ticket(identity)
+        except Exception as exc:
+            return RedirectResponse(append_query_value(redirect_to, auth_error=str(exc)))
+        return RedirectResponse(append_query_value(redirect_to, authentik_ticket=ticket))
+
+    @router.post("/auth/exchange")
+    async def exchange_auth_ticket(body: AuthTicketExchangeRequest):
+        identity = authentik_service.consume_ticket(body.ticket)
+        if identity is None:
+            raise HTTPException(status_code=401, detail={"error": "auth ticket is invalid"})
+        token = auth_service.issue_session_token(identity)
+        return build_auth_payload(identity, app_version, token=token)
+
+    @router.get("/auth/authentik/status")
+    async def authentik_status():
+        return {"enabled": authentik_service.is_enabled()}
 
     @router.get("/version")
     async def get_version():
@@ -326,44 +439,68 @@ def create_app() -> FastAPI:
         return {"config": config.update(payload)}
 
     @router.get("/api/auth/users")
-    async def list_user_keys(authorization: str | None = Header(default=None)):
+    async def list_users(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": auth_service.list_users()}
 
     @router.post("/api/auth/users")
-    async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_user(body: UserCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        item, raw_key = auth_service.create_key(role="user", name=body.name)
-        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
+        role = str(body.role or "user").strip().lower()
+        if role not in {"admin", "user"}:
+            raise HTTPException(status_code=400, detail={"error": "role is invalid"})
+        item = auth_service.create_user(
+            username=body.username,
+            display_name=body.display_name,
+            role=role,  # type: ignore[arg-type]
+            password=body.password,
+            enabled=True if body.enabled is None else bool(body.enabled),
+            daily_image_limit=body.daily_image_limit,
+            authentik_username=body.authentik_username,
+        )
+        return {"item": item, "items": auth_service.list_users()}
 
     @router.post("/api/auth/users/{key_id}")
-    async def update_user_key(
+    async def update_user(
             key_id: str,
-            body: UserKeyUpdateRequest,
+            body: UserUpdateRequest,
             authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
         updates = {
             key: value
             for key, value in {
-                "name": body.name,
+                "username": body.username,
+                "display_name": body.display_name,
+                "role": body.role,
+                "password": body.password,
                 "enabled": body.enabled,
+                "daily_image_limit": body.daily_image_limit,
+                "authentik_username": body.authentik_username,
             }.items()
             if value is not None
         }
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "no updates provided"})
-        item = auth_service.update_key(key_id, updates, role="user")
+        item = auth_service.update_user(key_id, updates)
         if item is None:
-            raise HTTPException(status_code=404, detail={"error": "user key not found"})
-        return {"item": item, "items": auth_service.list_keys(role="user")}
+            raise HTTPException(status_code=404, detail={"error": "user not found"})
+        return {"item": item, "items": auth_service.list_users()}
 
     @router.delete("/api/auth/users/{key_id}")
-    async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
+    async def delete_user(key_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        if not auth_service.delete_key(key_id, role="user"):
-            raise HTTPException(status_code=404, detail={"error": "user key not found"})
-        return {"items": auth_service.list_keys(role="user")}
+        if not auth_service.delete_user(key_id):
+            raise HTTPException(status_code=404, detail={"error": "user not found"})
+        return {"items": auth_service.list_users()}
+
+    @router.post("/api/auth/users/{key_id}/api-key")
+    async def reset_user_api_key(key_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        item, raw_key = auth_service.reset_api_key(key_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "user not found"})
+        return {"item": item, "key": raw_key, "items": auth_service.list_users()}
 
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
@@ -433,12 +570,20 @@ def create_app() -> FastAPI:
             request: Request,
             authorization: str | None = Header(default=None)
     ):
-        require_identity(authorization)
+        identity = require_identity(authorization)
         base_url = resolve_image_base_url(request)
         try:
             return await run_in_threadpool(
-                chatgpt_service.generate_with_pool, body.prompt, body.model, body.n, body.response_format, base_url
+                chatgpt_service.generate_with_pool,
+                body.prompt,
+                body.model,
+                body.n,
+                body.response_format,
+                base_url,
+                identity,
             )
+        except QuotaExceededError as exc:
+            raise HTTPException(status_code=429, detail={"error": f"daily image quota exceeded, remaining={exc.remaining}"}) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
@@ -453,7 +598,7 @@ def create_app() -> FastAPI:
             n: int = Form(default=1),
             response_format: str = Form(default="b64_json"),
     ):
-        require_identity(authorization)
+        identity = require_identity(authorization)
         if n < 1 or n > 4:
             raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
 
@@ -475,20 +620,29 @@ def create_app() -> FastAPI:
 
         try:
             return await run_in_threadpool(
-                chatgpt_service.edit_with_pool, prompt, images, model, n, response_format, base_url
+                chatgpt_service.edit_with_pool,
+                prompt,
+                images,
+                model,
+                n,
+                response_format,
+                base_url,
+                identity,
             )
+        except QuotaExceededError as exc:
+            raise HTTPException(status_code=429, detail={"error": f"daily image quota exceeded, remaining={exc.remaining}"}) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
-        require_identity(authorization)
-        return await run_in_threadpool(chatgpt_service.create_image_completion, body.model_dump(mode="python"))
+        identity = require_identity(authorization)
+        return await run_in_threadpool(chatgpt_service.create_image_completion, body.model_dump(mode="python"), identity)
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
-        require_identity(authorization)
-        return await run_in_threadpool(chatgpt_service.create_response, body.model_dump(mode="python"))
+        identity = require_identity(authorization)
+        return await run_in_threadpool(chatgpt_service.create_response, body.model_dump(mode="python"), identity)
 
     # ── CPA multi-pool endpoints ────────────────────────────────────
 

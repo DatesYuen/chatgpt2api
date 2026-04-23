@@ -5,6 +5,7 @@ from typing import Iterable
 from fastapi import HTTPException
 
 from services.account_service import AccountService
+from services.auth_service import AuthService, QuotaExceededError, auth_service
 from services.image_service import ImageGenerationError, edit_image_result, generate_image_result, is_token_invalid_error
 from services.utils import (
     build_chat_image_completion,
@@ -41,55 +42,86 @@ def _extract_response_image(input_value: object) -> tuple[bytes, str] | None:
 
 
 class ChatGPTService:
-    def __init__(self, account_service: AccountService):
+    def __init__(self, account_service: AccountService, auth_service_instance: AuthService | None = None):
         self.account_service = account_service
+        self.auth_service = auth_service_instance or auth_service
 
-    def generate_with_pool(self, prompt: str, model: str, n: int, response_format: str = "b64_json", base_url: str = None):
-        created = None
-        image_items: list[dict[str, object]] = []
+    def _run_with_quota(
+        self,
+        identity: dict[str, object] | None,
+        requested_images: int,
+        action,
+    ):
+        reservation = None
+        try:
+            if identity is not None and str(identity.get("role") or "") == "user":
+                reservation = self.auth_service.reserve_daily_quota(str(identity.get("id") or ""), requested_images)
+            result = action()
+            data = result.get("data") if isinstance(result, dict) else None
+            success_count = len(data) if isinstance(data, list) else 0
+            self.auth_service.settle_daily_quota(reservation, success_count)
+            return result
+        except Exception:
+            self.auth_service.settle_daily_quota(reservation, 0)
+            raise
 
-        for index in range(1, n + 1):
-            while True:
-                try:
-                    request_token = self.account_service.get_available_access_token()
-                except RuntimeError as exc:
-                    print(f"[image-generate] stop index={index}/{n} error={exc}")
-                    break
+    def generate_with_pool(
+        self,
+        prompt: str,
+        model: str,
+        n: int,
+        response_format: str = "b64_json",
+        base_url: str = None,
+        identity: dict[str, object] | None = None,
+    ):
+        def runner():
+            created = None
+            image_items: list[dict[str, object]] = []
 
-                print(f"[image-generate] start pooled token={request_token[:12]}... model={model} index={index}/{n}")
-                try:
-                    result = generate_image_result(request_token, prompt, model, response_format, base_url)
-                    account = self.account_service.mark_image_result(request_token, success=True)
-                    if created is None:
-                        created = result.get("created")
-                    data = result.get("data")
-                    if isinstance(data, list):
-                        image_items.extend(item for item in data if isinstance(item, dict))
-                    print(
-                        f"[image-generate] success pooled token={request_token[:12]}... "
-                        f"quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
-                    )
-                    break
-                except ImageGenerationError as exc:
-                    account = self.account_service.mark_image_result(request_token, success=False)
-                    message = str(exc)
-                    print(
-                        f"[image-generate] fail pooled token={request_token[:12]}... "
-                        f"error={message} quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
-                    )
-                    if is_token_invalid_error(message):
-                        self.account_service.remove_token(request_token)
-                        print(f"[image-generate] remove invalid token={request_token[:12]}...")
-                        continue
-                    break
+            for index in range(1, n + 1):
+                while True:
+                    try:
+                        request_token = self.account_service.get_available_access_token()
+                    except RuntimeError as exc:
+                        print(f"[image-generate] stop index={index}/{n} error={exc}")
+                        break
 
-        if not image_items:
-            raise ImageGenerationError("image generation failed")
+                    print(f"[image-generate] start pooled token={request_token[:12]}... model={model} index={index}/{n}")
+                    try:
+                        result = generate_image_result(request_token, prompt, model, response_format, base_url)
+                        account = self.account_service.mark_image_result(request_token, success=True)
+                        if created is None:
+                            created = result.get("created")
+                        data = result.get("data")
+                        if isinstance(data, list):
+                            image_items.extend(item for item in data if isinstance(item, dict))
+                        print(
+                            f"[image-generate] success pooled token={request_token[:12]}... "
+                            f"quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
+                        )
+                        break
+                    except ImageGenerationError as exc:
+                        account = self.account_service.mark_image_result(request_token, success=False)
+                        message = str(exc)
+                        print(
+                            f"[image-generate] fail pooled token={request_token[:12]}... "
+                            f"error={message} quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
+                        )
+                        if is_token_invalid_error(message):
+                            self.account_service.remove_token(request_token)
+                            print(f"[image-generate] remove invalid token={request_token[:12]}...")
+                            continue
+                        break
 
-        return {
-            "created": created,
-            "data": image_items,
-        }
+            if not image_items:
+                raise ImageGenerationError("image generation failed")
+
+            return {
+                "created": created,
+                "data": image_items,
+            }
+
+        return self._run_with_quota(identity, n, runner)
 
     def edit_with_pool(
         self,
@@ -99,60 +131,65 @@ class ChatGPTService:
         n: int,
         response_format: str = "b64_json",
         base_url: str = None,
+        identity: dict[str, object] | None = None,
     ):
-        created = None
-        image_items: list[dict[str, object]] = []
         normalized_images = list(images)
         if not normalized_images:
             raise ImageGenerationError("image is required")
 
-        for index in range(1, n + 1):
-            while True:
-                try:
-                    request_token = self.account_service.get_available_access_token()
-                except RuntimeError as exc:
-                    print(f"[image-edit] stop index={index}/{n} error={exc}")
-                    break
+        def runner():
+            created = None
+            image_items: list[dict[str, object]] = []
 
-                print(
-                    f"[image-edit] start pooled token={request_token[:12]}... "
-                    f"model={model} index={index}/{n} images={len(normalized_images)}"
-                )
-                try:
-                    result = edit_image_result(request_token, prompt, normalized_images, model, response_format, base_url)
-                    account = self.account_service.mark_image_result(request_token, success=True)
-                    if created is None:
-                        created = result.get("created")
-                    data = result.get("data")
-                    if isinstance(data, list):
-                        image_items.extend(item for item in data if isinstance(item, dict))
+            for index in range(1, n + 1):
+                while True:
+                    try:
+                        request_token = self.account_service.get_available_access_token()
+                    except RuntimeError as exc:
+                        print(f"[image-edit] stop index={index}/{n} error={exc}")
+                        break
+
                     print(
-                        f"[image-edit] success pooled token={request_token[:12]}... "
-                        f"quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
+                        f"[image-edit] start pooled token={request_token[:12]}... "
+                        f"model={model} index={index}/{n} images={len(normalized_images)}"
                     )
-                    break
-                except ImageGenerationError as exc:
-                    account = self.account_service.mark_image_result(request_token, success=False)
-                    message = str(exc)
-                    print(
-                        f"[image-edit] fail pooled token={request_token[:12]}... "
-                        f"error={message} quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
-                    )
-                    if is_token_invalid_error(message):
-                        self.account_service.remove_token(request_token)
-                        print(f"[image-edit] remove invalid token={request_token[:12]}...")
-                        continue
-                    break
+                    try:
+                        result = edit_image_result(request_token, prompt, normalized_images, model, response_format, base_url)
+                        account = self.account_service.mark_image_result(request_token, success=True)
+                        if created is None:
+                            created = result.get("created")
+                        data = result.get("data")
+                        if isinstance(data, list):
+                            image_items.extend(item for item in data if isinstance(item, dict))
+                        print(
+                            f"[image-edit] success pooled token={request_token[:12]}... "
+                            f"quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
+                        )
+                        break
+                    except ImageGenerationError as exc:
+                        account = self.account_service.mark_image_result(request_token, success=False)
+                        message = str(exc)
+                        print(
+                            f"[image-edit] fail pooled token={request_token[:12]}... "
+                            f"error={message} quota={account.get('quota') if account else 'unknown'} status={account.get('status') if account else 'unknown'}"
+                        )
+                        if is_token_invalid_error(message):
+                            self.account_service.remove_token(request_token)
+                            print(f"[image-edit] remove invalid token={request_token[:12]}...")
+                            continue
+                        break
 
-        if not image_items:
-            raise ImageGenerationError("image edit failed")
+            if not image_items:
+                raise ImageGenerationError("image edit failed")
 
-        return {
-            "created": created,
-            "data": image_items,
-        }
+            return {
+                "created": created,
+                "data": image_items,
+            }
 
-    def create_image_completion(self, body: dict[str, object]) -> dict[str, object]:
+        return self._run_with_quota(identity, n, runner)
+
+    def create_image_completion(self, body: dict[str, object], identity: dict[str, object] | None = None) -> dict[str, object]:
         if not is_image_chat_request(body):
             raise HTTPException(
                 status_code=400,
@@ -172,15 +209,20 @@ class ChatGPTService:
         try:
             if image_info:
                 image_data, mime_type = image_info
-                image_result = self.edit_with_pool(prompt, [(image_data, "image.png", mime_type)], model, n)
+                image_result = self.edit_with_pool(prompt, [(image_data, "image.png", mime_type)], model, n, identity=identity)
             else:
-                image_result = self.generate_with_pool(prompt, model, n)
+                image_result = self.generate_with_pool(prompt, model, n, identity=identity)
+        except QuotaExceededError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={"error": f"daily image quota exceeded, remaining={exc.remaining}"},
+            ) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
         return build_chat_image_completion(model, prompt, image_result)
 
-    def create_response(self, body: dict[str, object]) -> dict[str, object]:
+    def create_response(self, body: dict[str, object], identity: dict[str, object] | None = None) -> dict[str, object]:
         if bool(body.get("stream")):
             raise HTTPException(status_code=400, detail={"error": "stream is not supported"})
 
@@ -199,9 +241,20 @@ class ChatGPTService:
         try:
             if image_info:
                 image_data, mime_type = image_info
-                image_result = self.edit_with_pool(prompt, [(image_data, "image.png", mime_type)], "gpt-image-1", 1)
+                image_result = self.edit_with_pool(
+                    prompt,
+                    [(image_data, "image.png", mime_type)],
+                    "gpt-image-1",
+                    1,
+                    identity=identity,
+                )
             else:
-                image_result = self.generate_with_pool(prompt, "gpt-image-1", 1)
+                image_result = self.generate_with_pool(prompt, "gpt-image-1", 1, identity=identity)
+        except QuotaExceededError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={"error": f"daily image quota exceeded, remaining={exc.remaining}"},
+            ) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 

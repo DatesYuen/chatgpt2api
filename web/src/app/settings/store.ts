@@ -27,6 +27,13 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
+    authentik: {
+      enabled: Boolean(config.authentik?.enabled),
+      issuer: typeof config.authentik?.issuer === "string" ? config.authentik.issuer : "",
+      client_id: typeof config.authentik?.client_id === "string" ? config.authentik.client_id : "",
+      client_secret: typeof config.authentik?.client_secret === "string" ? config.authentik.client_secret : "",
+      scopes: typeof config.authentik?.scopes === "string" ? config.authentik.scopes : "openid profile email",
+    },
   };
 }
 
@@ -80,6 +87,7 @@ type SettingsStore = {
   setRefreshAccountIntervalMinute: (value: string) => void;
   setProxy: (value: string) => void;
   setBaseUrl: (value: string) => void;
+  setAuthentikField: (field: "enabled" | "issuer" | "client_id" | "client_secret" | "scopes", value: boolean | string) => void;
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -160,6 +168,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
+        authentik: {
+          enabled: Boolean(config.authentik?.enabled),
+          issuer: String(config.authentik?.issuer || "").trim(),
+          client_id: String(config.authentik?.client_id || "").trim(),
+          client_secret: String(config.authentik?.client_secret || "").trim(),
+          scopes: String(config.authentik?.scopes || "openid profile email").trim() || "openid profile email",
+        },
       });
       set({
         config: normalizeConfig(data.config),
@@ -209,6 +224,27 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         config: {
           ...state.config,
           base_url: value,
+        },
+      };
+    });
+  },
+
+  setAuthentikField: (field, value) => {
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      return {
+        config: {
+          ...state.config,
+          authentik: {
+            enabled: Boolean(state.config.authentik?.enabled),
+            issuer: String(state.config.authentik?.issuer || ""),
+            client_id: String(state.config.authentik?.client_id || ""),
+            client_secret: String(state.config.authentik?.client_secret || ""),
+            scopes: String(state.config.authentik?.scopes || "openid profile email"),
+            [field]: value,
+          },
         },
       };
     });

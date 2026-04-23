@@ -8,7 +8,7 @@ import { ImageComposer } from "@/app/image/components/image-composer";
 import { ImageResults, type ImageLightboxItem } from "@/app/image/components/image-results";
 import { ImageSidebar } from "@/app/image/components/image-sidebar";
 import { ImageLightbox } from "@/components/image-lightbox";
-import { editImage, fetchAccounts, generateImage, type Account } from "@/lib/api";
+import { editImage, fetchAccounts, fetchAuthMe, generateImage, type Account } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import {
   clearImageConversations,
@@ -238,13 +238,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   const loadQuota = useCallback(async () => {
-    if (!isAdmin) {
-      setAvailableQuota("--");
-      return;
-    }
     try {
-      const data = await fetchAccounts();
-      setAvailableQuota(formatAvailableQuota(data.items));
+      if (isAdmin) {
+        const data = await fetchAccounts();
+        setAvailableQuota(formatAvailableQuota(data.items));
+        return;
+      }
+      const data = await fetchAuthMe();
+      setAvailableQuota(String(data.quota_remaining ?? "--"));
     } catch {
       setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
     }
@@ -641,6 +642,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           };
         });
         toast.error(message);
+        await loadQuota();
       } finally {
         activeConversationQueueIds.delete(conversationId);
         for (const conversation of conversationsRef.current) {

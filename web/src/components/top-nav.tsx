@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { Github } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 
 import webConfig from "@/constants/common-env";
@@ -57,7 +56,7 @@ export function TopNav() {
   }
 
   const navItems = session.role === "admin" ? adminNavItems : userNavItems;
-  const roleLabel = session.role === "admin" ? "管理员" : "普通用户";
+  const userLabel = session.username || session.name || (session.role === "admin" ? "管理员" : "用户");
 
   return (
     <header>
@@ -67,18 +66,8 @@ export function TopNav() {
             href="/image"
             className="py-2 text-[15px] font-semibold tracking-tight text-stone-950 transition hover:text-stone-700"
           >
-            chatgpt2api
+            George绘图
           </Link>
-          <a
-            href="https://github.com/basketikun/chatgpt2api"
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 py-2 text-sm text-stone-400 transition hover:text-stone-700"
-            aria-label="GitHub repository"
-          >
-            <Github className="size-4" />
-            <span>GitHub</span>
-          </a>
         </div>
         <div className="flex justify-center gap-8">
           {navItems.map((item) => {
@@ -99,7 +88,7 @@ export function TopNav() {
           })}
         </div>
         <div className="flex flex-1 items-center justify-end gap-3">
-          <span className="rounded-md bg-stone-100 px-2 py-1 text-[11px] font-medium text-stone-500">{roleLabel}</span>
+          <span className="rounded-md bg-stone-100 px-2 py-1 text-[11px] font-medium text-stone-500">{userLabel}</span>
           <span className="rounded-md bg-stone-100 px-2 py-1 text-[11px] font-medium text-stone-500">
             v{webConfig.appVersion}
           </span>
