@@ -1,10 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from fastapi.testclient import TestClient
 
 from services import api as api_module
+from services.auth_service import AuthService
 
 
 class _FakeThread:
@@ -18,17 +21,33 @@ class _FakeChatGPTService:
     def __init__(self, _account_service) -> None:
         return None
 
-    def edit_with_pool(self, prompt: str, images, model: str, n: int):
+    def edit_with_pool(
+        self,
+        prompt: str,
+        images,
+        model: str,
+        n: int,
+        response_format: str = "b64_json",
+        base_url: str | None = None,
+    ):
         normalized_images = list(images)
         type(self).last_call = {
             "prompt": prompt,
             "images": normalized_images,
             "model": model,
             "n": n,
+            "response_format": response_format,
+            "base_url": base_url,
         }
         return {
             "created": 123,
             "data": [{"b64_json": "ZmFrZQ==", "revised_prompt": prompt}],
+        }
+
+    def generate_with_pool(self, prompt: str, model: str, n: int, response_format: str = "b64_json", base_url: str = ""):
+        return {
+            "created": 123,
+            "data": [{"b64_json": "ZmFrZQ==", "revised_prompt": prompt, "url": f"{base_url}/images/fake.png"}],
         }
 
 
@@ -74,10 +93,102 @@ class ImageEditsApiTests(unittest.TestCase):
             ["first.png", "second.png"],
         )
 
+
+class _FakeConfig:
+    def __init__(self, tmp_dir: str):
+        self.auth_key = "admin-secret"
+        self.refresh_account_interval_minute = 60
+        self.base_url = ""
+        self.images_dir = Path(tmp_dir) / "images"
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        self._data = {
+            "proxy": "",
+            "base_url": "",
+            "refresh_account_interval_minute": 60,
+        }
+
+    def get(self) -> dict[str, object]:
+        return dict(self._data)
+
+    def update(self, data: dict[str, object]) -> dict[str, object]:
+        self._data.update(dict(data or {}))
+        return self.get()
+
+    def get_proxy_settings(self) -> str:
+        return str(self._data.get("proxy") or "")
+
+
+class ApiAuthRoleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+
+        self.auth_service = AuthService(Path(self.tmp_dir.name) / "auth_keys.json")
+        self.user_item, self.user_key = self.auth_service.create_key(role="user", name="设计同学")
+        self.fake_config = _FakeConfig(self.tmp_dir.name)
+
+        self.patches = [
+            mock.patch.object(api_module, "auth_service", self.auth_service),
+            mock.patch.object(api_module, "config", self.fake_config),
+            mock.patch.object(api_module, "ChatGPTService", _FakeChatGPTService),
+            mock.patch.object(api_module, "start_limited_account_watcher", lambda _stop_event: _FakeThread()),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+        self.addCleanup(self._cleanup_patches)
+
+        self.client = TestClient(api_module.create_app())
+        self.addCleanup(self.client.close)
+
+    def _cleanup_patches(self) -> None:
+        for patcher in reversed(self.patches):
+            patcher.stop()
+
+    @staticmethod
+    def _auth_header(key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {key}"}
+
+    def test_login_returns_admin_and_user_role(self) -> None:
+        admin_response = self.client.post("/auth/login", headers=self._auth_header("admin-secret"))
+        user_response = self.client.post("/auth/login", headers=self._auth_header(self.user_key))
+
+        self.assertEqual(admin_response.status_code, 200)
+        self.assertEqual(admin_response.json()["role"], "admin")
+        self.assertEqual(user_response.status_code, 200)
+        self.assertEqual(user_response.json()["role"], "user")
+        self.assertEqual(user_response.json()["name"], "设计同学")
+
+    def test_user_is_forbidden_from_admin_endpoints(self) -> None:
+        settings_response = self.client.get("/api/settings", headers=self._auth_header(self.user_key))
+        user_keys_response = self.client.get("/api/auth/users", headers=self._auth_header(self.user_key))
+
+        self.assertEqual(settings_response.status_code, 403)
+        self.assertEqual(user_keys_response.status_code, 403)
+
+    def test_user_can_generate_images_and_admin_can_manage_user_keys(self) -> None:
+        image_response = self.client.post(
+            "/v1/images/generations",
+            headers=self._auth_header(self.user_key),
+            json={"prompt": "test prompt", "model": "gpt-image-1", "n": 1},
+        )
+        create_user_response = self.client.post(
+            "/api/auth/users",
+            headers=self._auth_header("admin-secret"),
+            json={"name": "运营同学"},
+        )
+
+        self.assertEqual(image_response.status_code, 200)
+        self.assertEqual(image_response.json()["data"][0]["revised_prompt"], "test prompt")
+        self.assertEqual(create_user_response.status_code, 200)
+        payload = create_user_response.json()
+        self.assertTrue(payload["key"].startswith("cg2a_user_"))
+        self.assertEqual(payload["item"]["role"], "user")
+        self.assertEqual(payload["item"]["name"], "运营同学")
+
     def test_accepts_repeated_image_bracket_field(self) -> None:
         response = self.client.post(
             "/v1/images/edits",
-            headers=self.auth_header,
+            headers=self._auth_header("admin-secret"),
             data={"prompt": "test prompt", "model": "gpt-image-1", "n": "1"},
             files=[
                 ("image[]", ("first.png", b"first", "image/png")),

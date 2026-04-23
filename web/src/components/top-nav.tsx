@@ -1,31 +1,63 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { Github } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 
 import webConfig from "@/constants/common-env";
-import { clearStoredAuthKey } from "@/store/auth";
+import { clearStoredAuthSession, getStoredAuthSession, type StoredAuthSession } from "@/store/auth";
 import { cn } from "@/lib/utils";
 
-const navItems = [
+const adminNavItems = [
   { href: "/image", label: "画图" },
   { href: "/accounts", label: "号池管理" },
   { href: "/settings", label: "设置" },
 ];
 
+const userNavItems = [{ href: "/image", label: "画图" }];
+
 export function TopNav() {
   const pathname = usePathname();
   const router = useRouter();
+  const [session, setSession] = useState<StoredAuthSession | null | undefined>(undefined);
+
+  useEffect(() => {
+    let active = true;
+
+    const load = async () => {
+      if (pathname === "/login") {
+        if (!active) {
+          return;
+        }
+        setSession(null);
+        return;
+      }
+
+      const storedSession = await getStoredAuthSession();
+      if (!active) {
+        return;
+      }
+      setSession(storedSession);
+    };
+
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [pathname]);
 
   const handleLogout = async () => {
-    await clearStoredAuthKey();
+    await clearStoredAuthSession();
     router.replace("/login");
   };
 
-  if (pathname === "/login") {
+  if (pathname === "/login" || session === undefined || !session) {
     return null;
   }
+
+  const navItems = session.role === "admin" ? adminNavItems : userNavItems;
+  const roleLabel = session.role === "admin" ? "管理员" : "普通用户";
 
   return (
     <header>
@@ -67,6 +99,7 @@ export function TopNav() {
           })}
         </div>
         <div className="flex flex-1 items-center justify-end gap-3">
+          <span className="rounded-md bg-stone-100 px-2 py-1 text-[11px] font-medium text-stone-500">{roleLabel}</span>
           <span className="rounded-md bg-stone-100 px-2 py-1 text-[11px] font-medium text-stone-500">
             v{webConfig.appVersion}
           </span>

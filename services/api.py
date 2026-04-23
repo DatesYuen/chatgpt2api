@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.account_service import account_service
+from services.auth_service import auth_service
 from services.chatgpt_service import ChatGPTService
 from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
@@ -97,6 +98,15 @@ class SettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class UserKeyCreateRequest(BaseModel):
+    name: str = ""
+
+
+class UserKeyUpdateRequest(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+
+
 class Sub2APIServerCreateRequest(BaseModel):
     name: str = ""
     base_url: str = ""
@@ -173,13 +183,37 @@ def extract_bearer_token(authorization: str | None) -> str:
     return value.strip()
 
 
-def require_auth_key(authorization: str | None) -> None:
-    if extract_bearer_token(authorization) != str(config.auth_key or "").strip():
+def _legacy_admin_identity(token: str) -> dict[str, object] | None:
+    legacy_auth_key = str(config.auth_key or "").strip()
+    if not legacy_auth_key or token != legacy_auth_key:
+        return None
+    return {
+        "id": "legacy-admin",
+        "name": "管理员",
+        "role": "admin",
+        "enabled": True,
+        "created_at": None,
+        "last_used_at": None,
+    }
+
+
+def require_identity(authorization: str | None, *, roles: tuple[str, ...] | None = None) -> dict[str, object]:
+    token = extract_bearer_token(authorization)
+    identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
+    if identity is None:
         raise HTTPException(status_code=401, detail={"error": "authorization is invalid"})
+    if roles is not None and str(identity.get("role") or "") not in roles:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+    return identity
+
+
+def require_admin(authorization: str | None) -> dict[str, object]:
+    return require_identity(authorization, roles=("admin",))
 
 
 def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    configured_base_url = str(getattr(config, "base_url", "") or "").strip()
+    return configured_base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
@@ -263,8 +297,14 @@ def create_app() -> FastAPI:
 
     @router.post("/auth/login")
     async def login(authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
-        return {"ok": True, "version": app_version}
+        identity = require_identity(authorization)
+        return {
+            "ok": True,
+            "version": app_version,
+            "role": identity.get("role"),
+            "subject_id": identity.get("id"),
+            "name": identity.get("name"),
+        }
 
     @router.get("/version")
     async def get_version():
@@ -272,7 +312,7 @@ def create_app() -> FastAPI:
 
     @router.get("/api/settings")
     async def get_settings(authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         return {"config": config.get()}
 
     @router.post("/api/settings")
@@ -280,17 +320,59 @@ def create_app() -> FastAPI:
             body: SettingsUpdateRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
-        return {"config": config.update(body.model_dump(mode="python"))}
+        require_admin(authorization)
+        payload = body.model_dump(mode="python")
+        payload.pop("auth-key", None)
+        return {"config": config.update(payload)}
+
+    @router.get("/api/auth/users")
+    async def list_user_keys(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"items": auth_service.list_keys(role="user")}
+
+    @router.post("/api/auth/users")
+    async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        item, raw_key = auth_service.create_key(role="user", name=body.name)
+        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
+
+    @router.post("/api/auth/users/{key_id}")
+    async def update_user_key(
+            key_id: str,
+            body: UserKeyUpdateRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        updates = {
+            key: value
+            for key, value in {
+                "name": body.name,
+                "enabled": body.enabled,
+            }.items()
+            if value is not None
+        }
+        if not updates:
+            raise HTTPException(status_code=400, detail={"error": "no updates provided"})
+        item = auth_service.update_key(key_id, updates, role="user")
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "user key not found"})
+        return {"item": item, "items": auth_service.list_keys(role="user")}
+
+    @router.delete("/api/auth/users/{key_id}")
+    async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        if not auth_service.delete_key(key_id, role="user"):
+            raise HTTPException(status_code=404, detail={"error": "user key not found"})
+        return {"items": auth_service.list_keys(role="user")}
 
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         return {"items": account_service.list_accounts()}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
@@ -305,7 +387,7 @@ def create_app() -> FastAPI:
 
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
@@ -313,7 +395,7 @@ def create_app() -> FastAPI:
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
         if not access_tokens:
             access_tokens = account_service.list_tokens()
@@ -323,7 +405,7 @@ def create_app() -> FastAPI:
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         access_token = str(body.access_token or "").strip()
         if not access_token:
             raise HTTPException(status_code=400, detail={"error": "access_token is required"})
@@ -351,7 +433,7 @@ def create_app() -> FastAPI:
             request: Request,
             authorization: str | None = Header(default=None)
     ):
-        require_auth_key(authorization)
+        require_identity(authorization)
         base_url = resolve_image_base_url(request)
         try:
             return await run_in_threadpool(
@@ -371,7 +453,7 @@ def create_app() -> FastAPI:
             n: int = Form(default=1),
             response_format: str = Form(default="b64_json"),
     ):
-        require_auth_key(authorization)
+        require_identity(authorization)
         if n < 1 or n > 4:
             raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
 
@@ -400,19 +482,19 @@ def create_app() -> FastAPI:
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_identity(authorization)
         return await run_in_threadpool(chatgpt_service.create_image_completion, body.model_dump(mode="python"))
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_identity(authorization)
         return await run_in_threadpool(chatgpt_service.create_response, body.model_dump(mode="python"))
 
     # ── CPA multi-pool endpoints ────────────────────────────────────
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         return {"pools": sanitize_cpa_pools(cpa_config.list_pools())}
 
     @router.post("/api/cpa/pools")
@@ -420,7 +502,7 @@ def create_app() -> FastAPI:
             body: CPAPoolCreateRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         if not body.base_url.strip():
             raise HTTPException(status_code=400, detail={"error": "base_url is required"})
         if not body.secret_key.strip():
@@ -438,7 +520,7 @@ def create_app() -> FastAPI:
             body: CPAPoolUpdateRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         pool = cpa_config.update_pool(pool_id, body.model_dump(exclude_none=True))
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
@@ -449,7 +531,7 @@ def create_app() -> FastAPI:
             pool_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         if not cpa_config.delete_pool(pool_id):
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
         return {"pools": sanitize_cpa_pools(cpa_config.list_pools())}
@@ -459,7 +541,7 @@ def create_app() -> FastAPI:
             pool_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         pool = cpa_config.get_pool(pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
@@ -472,7 +554,7 @@ def create_app() -> FastAPI:
             body: CPAImportRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         pool = cpa_config.get_pool(pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
@@ -484,7 +566,7 @@ def create_app() -> FastAPI:
 
     @router.get("/api/cpa/pools/{pool_id}/import")
     async def cpa_pool_import_progress(pool_id: str, authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         pool = cpa_config.get_pool(pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
@@ -494,7 +576,7 @@ def create_app() -> FastAPI:
 
     @router.get("/api/sub2api/servers")
     async def list_sub2api_servers(authorization: str | None = Header(default=None)):
-        require_auth_key(authorization)
+        require_admin(authorization)
         return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
 
     @router.post("/api/sub2api/servers")
@@ -502,7 +584,7 @@ def create_app() -> FastAPI:
             body: Sub2APIServerCreateRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         if not body.base_url.strip():
             raise HTTPException(status_code=400, detail={"error": "base_url is required"})
         has_login = body.email.strip() and body.password.strip()
@@ -531,7 +613,7 @@ def create_app() -> FastAPI:
             body: Sub2APIServerUpdateRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         server = sub2api_config.update_server(server_id, body.model_dump(exclude_none=True))
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
@@ -545,7 +627,7 @@ def create_app() -> FastAPI:
             server_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         if not sub2api_config.delete_server(server_id):
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
@@ -555,7 +637,7 @@ def create_app() -> FastAPI:
             server_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         server = sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
@@ -570,7 +652,7 @@ def create_app() -> FastAPI:
             server_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         server = sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
@@ -586,7 +668,7 @@ def create_app() -> FastAPI:
             body: Sub2APIImportRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         server = sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
@@ -601,7 +683,7 @@ def create_app() -> FastAPI:
             server_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         server = sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
@@ -614,7 +696,7 @@ def create_app() -> FastAPI:
             body: ProxyTestRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_auth_key(authorization)
+        require_admin(authorization)
         candidate = (body.url or "").strip()
         if not candidate:
             candidate = config.get_proxy_settings()
@@ -626,8 +708,9 @@ def create_app() -> FastAPI:
     app.include_router(router)
 
     # 挂载静态图片目录
-    if config.images_dir.exists():
-        app.mount("/images", StaticFiles(directory=str(config.images_dir)), name="images")
+    images_dir = getattr(config, "images_dir", None)
+    if images_dir is not None and Path(images_dir).exists():
+        app.mount("/images", StaticFiles(directory=str(images_dir)), name="images")
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_web(full_path: str):

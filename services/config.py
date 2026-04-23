@@ -105,13 +105,17 @@ class ConfigStore:
         ).strip().rstrip("/")
 
     def get(self) -> dict[str, object]:
-        return dict(self.data)
+        data = dict(self.data)
+        data.pop("auth-key", None)
+        return data
 
     def get_proxy_settings(self) -> str:
         return str(self.data.get("proxy") or "").strip()
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
-        self.data = dict(data or {})
+        next_data = dict(self.data)
+        next_data.update(dict(data or {}))
+        self.data = next_data
         self._save()
         return self.get()
 

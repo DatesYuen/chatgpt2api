@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LoaderCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { ImageComposer } from "@/app/image/components/image-composer";
@@ -8,6 +9,7 @@ import { ImageResults, type ImageLightboxItem } from "@/app/image/components/ima
 import { ImageSidebar } from "@/app/image/components/image-sidebar";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { editImage, fetchAccounts, generateImage, type Account } from "@/lib/api";
+import { useAuthGuard } from "@/lib/use-auth-guard";
 import {
   clearImageConversations,
   deleteImageConversation,
@@ -161,7 +163,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
   return normalized;
 }
 
-export default function ImagePage() {
+function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const didLoadQuotaRef = useRef(false);
   const conversationsRef = useRef<ImageConversation[]>([]);
   const resultsViewportRef = useRef<HTMLDivElement>(null);
@@ -236,13 +238,17 @@ export default function ImagePage() {
   }, []);
 
   const loadQuota = useCallback(async () => {
+    if (!isAdmin) {
+      setAvailableQuota("--");
+      return;
+    }
     try {
       const data = await fetchAccounts();
       setAvailableQuota(formatAvailableQuota(data.items));
     } catch {
       setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
     }
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     if (didLoadQuotaRef.current) {
@@ -259,7 +265,7 @@ export default function ImagePage() {
     return () => {
       window.removeEventListener("focus", handleFocus);
     };
-  }, [loadQuota]);
+  }, [isAdmin, loadQuota]);
 
   useEffect(() => {
     if (!selectedConversation) {
@@ -283,12 +289,6 @@ export default function ImagePage() {
       window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
     }
   }, [selectedConversationId]);
-
-  useEffect(() => {
-    if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
-      setSelectedConversationId(pickFallbackConversationId(conversations));
-    }
-  }, [conversations, selectedConversationId]);
 
   const persistConversation = async (conversation: ImageConversation) => {
     const nextConversations = sortImageConversations([
@@ -458,6 +458,7 @@ export default function ImagePage() {
     setLightboxOpen(true);
   }, []);
 
+  /* eslint-disable react-hooks/preserve-manual-memoization */
   const runConversationQueue = useCallback(
     async (conversationId: string) => {
       if (activeConversationQueueIds.has(conversationId)) {
@@ -654,6 +655,7 @@ export default function ImagePage() {
     },
     [loadQuota, updateConversation],
   );
+  /* eslint-enable react-hooks/preserve-manual-memoization */
 
   useEffect(() => {
     for (const conversation of conversations) {
@@ -785,4 +787,18 @@ export default function ImagePage() {
       />
     </>
   );
+}
+
+export default function ImagePage() {
+  const { isCheckingAuth, session } = useAuthGuard();
+
+  if (isCheckingAuth || !session) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+      </div>
+    );
+  }
+
+  return <ImagePageContent isAdmin={session.role === "admin"} />;
 }
