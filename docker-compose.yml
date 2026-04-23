@@ -10,4 +10,4 @@ services:
       - "3000:80"
     volumes:
       - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config.json

@@ -216,6 +216,17 @@ class ApiAuthRoleTests(unittest.TestCase):
             ["first.png", "second.png"],
         )
 
+    def test_settings_save_returns_readable_error_when_config_is_not_writable(self) -> None:
+        with mock.patch.object(self.fake_config, "update", side_effect=PermissionError("config is read-only")):
+            response = self.client.post(
+                "/api/settings",
+                headers=self._auth_header("admin-secret"),
+                json={"proxy": "", "base_url": ""},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("save settings failed", response.json()["detail"]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

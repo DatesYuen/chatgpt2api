@@ -436,7 +436,10 @@ def create_app() -> FastAPI:
         require_admin(authorization)
         payload = body.model_dump(mode="python")
         payload.pop("auth-key", None)
-        return {"config": config.update(payload)}
+        try:
+            return {"config": config.update(payload)}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail={"error": f"save settings failed: {exc}"}) from exc
 
     @router.get("/api/auth/users")
     async def list_users(authorization: str | None = Header(default=None)):

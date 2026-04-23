@@ -36,7 +36,17 @@ class AuthentikService:
 
     @staticmethod
     def _request_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, data: bytes | None = None) -> dict[str, object]:
-        request = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        request_headers = {
+            "Accept": "application/json",
+            # Some reverse proxies / WAF rules reject the default Python urllib UA with 403.
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            **(headers or {}),
+        }
+        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if not isinstance(payload, dict):
