@@ -38,6 +38,27 @@ class ImageBaseUrlApiTests(unittest.TestCase):
 
         self.assertEqual(api_module.resolve_image_base_url(request), "https://public.example.com")
 
+    def test_public_base_url_prefers_configured_base_url(self) -> None:
+        request = SimpleNamespace(
+            url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8000"),
+            headers={"host": "127.0.0.1:8000"},
+        )
+
+        self.assertEqual(api_module.resolve_public_base_url(request), "https://public.example.com")
+
+    def test_public_base_url_prefers_forwarded_headers(self) -> None:
+        self.fake_config.base_url = ""
+        request = SimpleNamespace(
+            url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8000"),
+            headers={
+                "host": "127.0.0.1:8000",
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "draw.example.com",
+            },
+        )
+
+        self.assertEqual(api_module.resolve_public_base_url(request), "https://draw.example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -242,6 +242,24 @@ def resolve_image_base_url(request: Request) -> str:
     return configured_base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
+def resolve_public_base_url(request: Request) -> str:
+    configured_base_url = str(getattr(config, "base_url", "") or "").strip().rstrip("/")
+    if configured_base_url:
+        return configured_base_url
+
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").strip()
+    forwarded_host = str(request.headers.get("x-forwarded-host") or "").strip()
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+
+    host = str(request.headers.get("host") or request.url.netloc).strip()
+    return f"{request.url.scheme}://{host}".rstrip("/")
+
+
+def build_public_callback_url(request: Request, path: str) -> str:
+    return f"{resolve_public_base_url(request)}{path if path.startswith('/') else f'/{path}'}"
+
+
 def build_auth_payload(identity: dict[str, object], app_version: str, *, token: str | None = None) -> dict[str, object]:
     quota = auth_service.get_quota_status(str(identity.get("id") or identity.get("subject_id") or "")) or {}
     return {
@@ -296,11 +314,15 @@ def resolve_web_asset(requested_path: str) -> Path | None:
         candidates = [WEB_DIST_DIR / "index.html"]
     else:
         relative_path = Path(clean_path)
-        candidates = [
-            WEB_DIST_DIR / relative_path,
+        # Prefer exported route directories (`/login/ -> login/index.html`) over legacy flat files.
+        candidates = []
+        if relative_path.suffix:
+            candidates.append(WEB_DIST_DIR / relative_path)
+        candidates.extend([
             WEB_DIST_DIR / relative_path / "index.html",
             WEB_DIST_DIR / f"{clean_path}.html",
-        ]
+            WEB_DIST_DIR / relative_path,
+        ])
 
     for candidate in candidates:
         try:
@@ -369,7 +391,7 @@ def create_app() -> FastAPI:
     @router.get("/auth/authentik/start")
     async def authentik_start(request: Request, redirect_to: str | None = Query(default=None)):
         try:
-            redirect_uri = str(request.url_for("authentik_callback"))
+            redirect_uri = build_public_callback_url(request, "/auth/authentik/callback")
             start_url = authentik_service.build_authorization_url(
                 redirect_uri=redirect_uri,
                 redirect_to=str(redirect_to or "/login"),
@@ -392,7 +414,10 @@ def create_app() -> FastAPI:
         if state_payload is None:
             return RedirectResponse(append_query_value(redirect_to, auth_error="invalid_state"))
         try:
-            claims = authentik_service.exchange_code(code=code, redirect_uri=str(request.url_for("authentik_callback")))
+            claims = authentik_service.exchange_code(
+                code=code,
+                redirect_uri=build_public_callback_url(request, "/auth/authentik/callback"),
+            )
             user = auth_service.upsert_authentik_user(claims)
             identity = auth_service.get_public_user(str(user.get("id") or ""))
             if identity is None:
@@ -870,7 +895,17 @@ def create_app() -> FastAPI:
         app.mount("/images", StaticFiles(directory=str(images_dir)), name="images")
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def serve_web(full_path: str):
+    async def serve_web(full_path: str, request: Request):
+        normalized_path = full_path.strip("/")
+        if normalized_path and "." not in Path(normalized_path).name and not request.url.path.endswith("/"):
+            directory_index = WEB_DIST_DIR / normalized_path / "index.html"
+            try:
+                directory_index.relative_to(WEB_DIST_DIR)
+            except ValueError:
+                directory_index = Path("__invalid__")
+            if directory_index.is_file():
+                return RedirectResponse(f"{request.url.path}/", status_code=307)
+
         asset = resolve_web_asset(full_path)
         if asset is not None:
             return FileResponse(asset)
