@@ -4,10 +4,12 @@ import json
 import secrets
 import time
 import urllib.parse
-import urllib.request
 from threading import Lock
 
+from curl_cffi.requests import Session
+
 from services.config import config
+from services.proxy_service import proxy_settings
 
 
 class AuthentikService:
@@ -37,18 +39,28 @@ class AuthentikService:
     @staticmethod
     def _request_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, data: bytes | None = None) -> dict[str, object]:
         request_headers = {
-            "Accept": "application/json",
-            # Some reverse proxies / WAF rules reject the default Python urllib UA with 403.
-            "User-Agent": (
+            "accept": "application/json",
+            # Use a browser impersonation to avoid WAF / reverse-proxy rules that block Python clients.
+            "user-agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
-            **(headers or {}),
+            **{str(key).lower(): str(value) for key, value in (headers or {}).items()},
         }
-        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        session = Session(**proxy_settings.build_session_kwargs(impersonate="edge101", verify=True))
+        try:
+            response = session.request(method.upper(), url, headers=request_headers, data=data, timeout=20)
+        except Exception as exc:
+            raise RuntimeError(f"{method.upper()} {url} failed: {exc}") from exc
+        finally:
+            session.close()
+        if int(response.status_code) >= 400:
+            raise RuntimeError(f"{method.upper()} {url} failed: HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except Exception:
+            payload = json.loads(response.text)
         if not isinstance(payload, dict):
             raise RuntimeError("invalid response payload")
         return payload
