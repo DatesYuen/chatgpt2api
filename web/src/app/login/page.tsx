@@ -17,7 +17,7 @@ type LoginMode = "password" | "key";
 
 function getAuthentikStartUrl() {
   const apiBase = webConfig.apiUrl.replace(/\/$/, "");
-  const redirectTo = typeof window === "undefined" ? "/login" : `${window.location.origin}/login`;
+  const redirectTo = typeof window === "undefined" ? "/login/" : `${window.location.origin}/login/`;
   return `${apiBase}/auth/authentik/start?redirect_to=${encodeURIComponent(redirectTo)}`;
 }
 
@@ -78,7 +78,7 @@ function LoginPageContent() {
   useEffect(() => {
     if (authentikError) {
       toast.error(decodeURIComponent(authentikError));
-      router.replace("/login");
+      router.replace("/login/");
       return;
     }
     if (!authentikTicket) {
@@ -99,7 +99,7 @@ function LoginPageContent() {
           return;
         }
         toast.error(error instanceof Error ? error.message : "Authentik 登录失败");
-        router.replace("/login");
+        router.replace("/login/");
       })
       .finally(() => {
         if (active) {

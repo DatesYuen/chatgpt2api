@@ -286,6 +286,13 @@ def append_query_value(target: str, **updates: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+def with_trailing_slash(path: str) -> str:
+    normalized = str(path or "").strip() or "/"
+    if normalized == "/":
+        return normalized
+    return normalized if normalized.endswith("/") else f"{normalized}/"
+
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
 
@@ -394,7 +401,7 @@ def create_app() -> FastAPI:
             redirect_uri = build_public_callback_url(request, "/auth/authentik/callback")
             start_url = authentik_service.build_authorization_url(
                 redirect_uri=redirect_uri,
-                redirect_to=str(redirect_to or "/login"),
+                redirect_to=with_trailing_slash(str(redirect_to or "/login")),
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -408,7 +415,7 @@ def create_app() -> FastAPI:
         error: str | None = None,
     ):
         state_payload = authentik_service.pop_state(state)
-        redirect_to = str((state_payload or {}).get("redirect_to") or "/login")
+        redirect_to = with_trailing_slash(str((state_payload or {}).get("redirect_to") or "/login"))
         if error:
             return RedirectResponse(append_query_value(redirect_to, auth_error=str(error)))
         if state_payload is None:
@@ -904,7 +911,10 @@ def create_app() -> FastAPI:
             except ValueError:
                 directory_index = Path("__invalid__")
             if directory_index.is_file():
-                return RedirectResponse(f"{request.url.path}/", status_code=307)
+                redirect_target = f"{request.url.path}/"
+                if request.url.query:
+                    redirect_target = f"{redirect_target}?{request.url.query}"
+                return RedirectResponse(redirect_target, status_code=307)
 
         asset = resolve_web_asset(full_path)
         if asset is not None:
